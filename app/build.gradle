@@ -4,10 +4,119 @@ apply plugin: 'jacoco'
 
 jacoco {
     toolVersion = "$jacocoVersion"
+    reportsDir = file("$project.buildDir/customJacocoReportDir")
 }
 
 tasks.withType(Test) {
     jacoco.includeNoLocationClasses = true
+}
+
+ext {
+    limits = [
+            'instruction': 93,
+            'branch'     : 88,
+            'Line'       : 0,
+            'complexity' : 84,
+            'Method'     : 0,
+            'Class'      : 0 //TODO - 100%
+    ]
+
+}
+
+project.ext {
+    codeCoverageMetrics = [:]
+}
+
+task publishToGraphana(type:Exec, dependsOn:'buildShellScript' ) {
+    workingDir project.buildDir
+    commandLine 'sh', './report.sh'
+}
+
+task buildShellScript(dependsOn:'parseJacocoReport' ) {
+    doLast {
+        println(project.codeCoverageMetrics)
+
+        def awsCommand = 'aws cloudwatch put-metric-data --namespace fusion-production-android';
+
+        project.codeCoverageMetrics.each {
+
+            awsCommand += ' '
+            awsCommand += '--dimensions Name=Coverage --metric-name'
+            awsCommand += ' '
+            awsCommand += it.key
+            awsCommand += ' '
+            awsCommand += '--value'
+            awsCommand += ' '
+            awsCommand += it.value
+        }
+
+        println(awsCommand)
+        File file = new File("$project.buildDir/report.sh");
+        file.text = awsCommand
+    }
+}
+
+task parseJacocoReport(dependsOn:'jacocoTestReport' ) {
+    doLast {
+        def report = file("$project.buildDir/customJacocoReportDir/jacocoTestReport/jacocoTestReport.xml")
+        logger.lifecycle("Checking coverage results: ${report}")
+
+        def parser = new XmlParser()
+        parser.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+        parser.setFeature("http://apache.org/xml/features/disallow-doctype-decl", false)
+        def results = parser.parse(report)
+        def counters = results.counter
+
+        //getting line coverage
+
+        def lineNode = counters.find { it.'@type'.equals('LINE') }
+        def lineMissed = lineNode.@missed as Double
+        def lineCovered = lineNode.@covered as Double
+        def linePercentage = ((lineCovered / (lineCovered + lineMissed)) * 100).round(2)
+        logger.lifecycle("Checking line results: ${linePercentage}")
+
+        def classNode = counters.find { it.'@type'.equals('CLASS') }
+        def classMissed = classNode.@missed as Double
+        def classCovered = classNode.@covered as Double
+        def classPercentage = ((classCovered / (classCovered + classMissed)) * 100).round(2)
+        logger.lifecycle("Checking line results: ${classPercentage}")
+
+        def methodNode = counters.find { it.'@type'.equals('METHOD') }
+        def methodMissed = methodNode.@missed as Double
+        def methodCovered = methodNode.@covered as Double
+        def methodPercentage = ((methodCovered / (methodCovered + methodMissed)) * 100).round(2)
+        logger.lifecycle("Checking line results: ${methodPercentage}")
+
+
+        //def metrics = [:]
+        project.codeCoverageMetrics << [
+                'Line'       : linePercentage,
+                'Method'     : methodPercentage,
+                'Class'      : classPercentage
+        ]
+
+
+        def failures = []
+        project.codeCoverageMetrics.each {
+            def limit = limits[it.key]
+            if (it.value < limit) {
+                failures.add("- ${it.key} coverage rate is: ${it.value}%, minimum is ${limit}%")
+            }
+        }
+
+        if (failures) {
+            logger.quiet("------------------ Code Coverage Failed -----------------------")
+            failures.each {
+                logger.quiet(it)
+            }
+            logger.quiet("---------------------------------------------------------------")
+            throw new GradleException("Code coverage failed")
+        } else {
+            logger.quiet("Passed Code Coverage Checks")
+        }
+
+        println(project.codeCoverageMetrics)
+    }
 }
 
 task jacocoTestReport(type: JacocoReport, dependsOn: ['testDebugUnitTest', 'createDebugCoverageReport']) {
@@ -28,6 +137,9 @@ task jacocoTestReport(type: JacocoReport, dependsOn: ['testDebugUnitTest', 'crea
     ])
 }
 
+parseJacocoReport.mustRunAfter jacocoTestReport
+buildShellScript.mustRunAfter parseJacocoReport
+publishToGraphana.mustRunAfter buildShellScript
 
 android {
     compileSdkVersion 27
@@ -54,9 +166,15 @@ android {
     testOptions {
         execution 'ANDROID_TEST_ORCHESTRATOR'
         animationsDisabled true
+        unitTests.returnDefaultValues = true
 
         unitTests {
             includeAndroidResources = true
+        }
+        unitTests.all {
+            jacoco {
+                includeNoLocationClasses = true
+            }
         }
     }
 }
